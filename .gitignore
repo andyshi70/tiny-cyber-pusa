@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# 现有大型项目目录（本轮未纳入 git，避免 2G+ 构建产物拖入）
+/pxiu/
+/pxiu-app/
+/dist/
+
+# 旧备份
+AGENTS.md.backupu.md
+AGENTS.md.v7.md
+AGENTSold.md
+opencode.json.bk
+
+# 私有：本地 agent 规则与 opencode 配置，不提交到 GitHub
+AGENTS.md
+opencode.json
+
+# Python
+__pycache__/
+*.pyc

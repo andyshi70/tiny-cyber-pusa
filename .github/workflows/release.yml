@@ -1,0 +1,150 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # PRs get the build gate on every pull request, no path filter: master
+  # requires these checks, and a filtered trigger would strand a docs-only PR
+  # with no statuses to satisfy. Releases still only happen on tags: the
+  # publish step below is gated on the ref, and a fork PR's token is read-only.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      # master requires this job's status, so it has to fail when the suite
+      # fails — compiling alone would green-light a broken tree.
+      - name: Vet and test
+        shell: pwsh
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+
+      # No -s -w: a Go exe with its symbol table stripped is deleted by 火绒
+      # within about a minute of landing on a Windows machine, which is exactly
+      # what the downloaded zip is unpacked into here.
+      - name: Build
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v','' -replace '/','-'
+          go build -trimpath -ldflags "-H=windowsgui -X zen-gate/internal/gateway.Version=$ver -X zen-gate/internal/update.Current=$ver" -o dist/zen-gate.exe ./cmd/zen-gate
+          go build -trimpath -o dist/zenstats.exe ./cmd/zenstats
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v','' -replace '/','-'
+          Copy-Item README.md dist/README.md
+          Copy-Item LICENSE dist/LICENSE
+          if (-not (Test-Path dist/zen-gate.exe)) { throw "zen-gate.exe missing" }
+          tar -a -c -f "dist/zen-gate-$ver.zip" -C dist zen-gate.exe README.md LICENSE
+          Get-ChildItem dist
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = $tag -replace '^v','' -replace '/','-'
+          $assets = @("dist/zen-gate.exe", "dist/zenstats.exe", "dist/zen-gate-$ver.zip")
+          # A tag published once and re-run (a failed later step, a
+          # workflow_dispatch) already owns the release; gh release create exits
+          # non-zero there, so the binaries never got uploaded on the retry.
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag $assets --clobber
+            gh release edit $tag --latest
+          } else {
+            gh release create $tag $assets --title $tag --generate-notes --latest
+          }
+
+  # The Linux port ships for real: the AppImage bundles GTK3 plus
+  # libayatana-appindicator, the .deb depends on the distro's libraries. The
+  # job also doubles as the PR build gate for the linux-tagged files — the
+  # Windows and macOS runners never compile those.
+  build-linux:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
+
+      # dpkg-deb rejects versions that do not start with a digit, so dispatch
+      # and PR builds get a synthetic version; tags pass their own through.
+      - name: Compute version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build AppImage
+        run: tools/build-linux.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Build .deb
+        run: tools/build-deb.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" dist/*.AppImage dist/*.deb --clobber
+
+  # The macOS port builds here but is not published: the bundle is only
+  # ad-hoc signed, and shipping that would hand every user a Gatekeeper warning
+  # until there is a Developer ID to notarize against. This job is the build
+  # gate — it fails the tag when the Objective-C window layer or the universal
+  # lipo step breaks. Publish the artifact below by hand, or add signing first.
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      # The darwin-only tests (launchd autostart, scutil proxy parsing, the
+      # macOS data dir) have no other place to run.
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: tools/build-macos.sh "${GITHUB_REF_NAME#v}" | tr '/' '-'
+
+      - name: Verify
+        run: |
+          lipo -info "dist/Zen Gate.app/Contents/MacOS/zen-gate"
+          codesign --verify --deep --strict "dist/Zen Gate.app"
+          plutil -lint "dist/Zen Gate.app/Contents/Info.plist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zen-gate-macos
+          path: |
+            dist/Zen Gate.app
+            dist/zen-gate-darwin
+            dist/zen-gate-*-darwin.zip
+          if-no-files-found: error
